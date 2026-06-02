@@ -218,7 +218,8 @@ class BEVFormer(MVXTwoStageDetector):
         )
         enhanced_prev_bev = self.temporal_mamba(merged, return_bev=True)
         enhanced_prev_bev = enhanced_prev_bev.permute(1, 0, 2).contiguous()  # [hw, bs, c]
-        return self._restore_prev_bev_format(enhanced_prev_bev, src_format)
+        fused_prev_bev = enhanced_prev_bev + prev_bev_hwbs
+        return self._restore_prev_bev_format(fused_prev_bev, src_format)
 
     def forward_pts_train(self,
                           pts_feats,
@@ -367,12 +368,17 @@ class BEVFormer(MVXTwoStageDetector):
 
 
     def obtain_history_bev(self, imgs_queue, img_metas_list):
-        """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
+        """Obtain history BEV features iteratively without Mamba enhancement.
+
+        The temporal queue is filled with per-frame history BEV in sample order.
+        Mamba fusion is deferred to current keyframe generation.
         """
         self.eval()
 
         with torch.no_grad():
             prev_bev = None
+            if self.use_bev_queue and self.bev_temporal_queue is not None:
+                self.bev_temporal_queue.reset()
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
             imgs_queue = imgs_queue.reshape(bs * len_queue, num_cams, C, H, W)
             img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
@@ -380,11 +386,12 @@ class BEVFormer(MVXTwoStageDetector):
                 img_metas = [each[i] for each in img_metas_list]
                 if not img_metas[0]['prev_bev_exists']:
                     prev_bev = None
-                # img_feats = self.extract_feat(img=img, img_metas=img_metas)
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
                 prev_bev = self.pts_bbox_head(
                     img_feats, img_metas, prev_bev, only_bev=True)
-                prev_bev = self._build_temporal_aug_prev_bev(prev_bev, img_metas)
+                if self.use_bev_queue and self.bev_temporal_queue is not None and prev_bev is not None:
+                    prev_bev_hwbs, _ = self._to_hwbs(prev_bev)
+                    self.bev_temporal_queue.update(prev_bev_hwbs, img_metas)
             self.train()
             return prev_bev
 
@@ -460,6 +467,8 @@ class BEVFormer(MVXTwoStageDetector):
         img_metas = [each[len_queue - 1] for each in img_metas]
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
+        else:
+            prev_bev = self._build_temporal_aug_prev_bev(prev_bev, img_metas)
 
         if os.getenv('DEBUG_FORWARD_TRAIN_GT3D', '0') == '1':
             has_none = isinstance(gt_labels_3d, list) and any(x is None for x in gt_labels_3d)
@@ -489,6 +498,8 @@ class BEVFormer(MVXTwoStageDetector):
                                             gt_bboxes_ignore, prev_bev)
 
         losses.update(losses_pts)
+        if self.use_bev_queue and self.bev_temporal_queue is not None:
+            self.bev_temporal_queue.reset()
         return losses
 
     def forward_test(self, img_metas, img=None, **kwargs):

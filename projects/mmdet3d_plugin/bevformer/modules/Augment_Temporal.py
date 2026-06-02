@@ -96,25 +96,62 @@ class Temporal_bev_queue(nn.Module):
         self.queue.clear()
 
     def _extract_yaw(self, img_metas, device, dtype):
-        yaw = [meta['can_bus'][-1] for meta in img_metas]
-        return torch.as_tensor(yaw, device=device, dtype=dtype)
+        """Extract yaw in degrees. Prefer can_bus[-1], fallback to ego quaternion."""
+        yaws = []
+        for meta in img_metas:
+            can_bus = meta.get('can_bus', None)
+            yaw_deg = None
+            if can_bus is not None:
+                can_bus = np.asarray(can_bus).reshape(-1)
+                if can_bus.size >= 1:
+                    # Dataset packs yaw degree at can_bus[-1].
+                    yaw_deg = float(can_bus[-1])
+            if yaw_deg is None:
+                rotation = meta.get('ego2global_rotation', [1.0, 0.0, 0.0, 0.0])
+                yaw_deg = Quaternion(rotation).yaw_pitch_roll[0] * 180.0 / np.pi
+            yaws.append(yaw_deg)
+        return torch.as_tensor(yaws, device=device, dtype=dtype)
 
     def _extract_timestamps(self, img_metas, device, dtype):
-        timestamps = [meta.get('timestamp', 0.0) for meta in img_metas]
+        """Extract timestamps in seconds (compatible with both s/us inputs)."""
+        timestamps = []
+        for meta in img_metas:
+            ts = float(meta.get('timestamp', 0.0))
+            if ts > 1e5:
+                ts = ts / 1e6
+            timestamps.append(ts)
         return torch.as_tensor(timestamps, device=device, dtype=dtype)
 
     def _extract_ego_pose(self, img_metas, device, dtype):
+        """Build ego-to-global SE(3) from ego2global fields, fallback to can_bus."""
         poses = []
         for meta in img_metas:
-            translation = np.array(meta.get('ego2global_translation', [0.0, 0.0, 0.0]), dtype=np.float32)
-            rotation = meta.get('ego2global_rotation', [1.0, 0.0, 0.0, 0.0])
-            rotation_matrix = Quaternion(rotation).rotation_matrix
+            can_bus = meta.get('can_bus', None)
+            if can_bus is not None:
+                can_bus = np.asarray(can_bus).reshape(-1)
+            translation = meta.get('ego2global_translation', None)
+            rotation = meta.get('ego2global_rotation', None)
+
+            if can_bus is not None and can_bus.size >= 7:
+                if translation is None:
+                    translation = can_bus[:3]
+                if rotation is None:
+                    rotation = can_bus[3:7]
+
+            if translation is None:
+                translation = [0.0, 0.0, 0.0]
+            if rotation is None:
+                rotation = [1.0, 0.0, 0.0, 0.0]
+
+            translation = np.asarray(translation, dtype=np.float32).reshape(3)
+            rotation = np.asarray(rotation, dtype=np.float32).reshape(4)
+            rotation_matrix = Quaternion(rotation).rotation_matrix.astype(np.float32)
             pose = np.eye(4, dtype=np.float32)
             pose[:3, :3] = rotation_matrix
             pose[:3, 3] = translation
             poses.append(pose)
-        poses = torch.as_tensor(np.stack(poses, axis=0), device=device, dtype=dtype)
-        return poses
+
+        return torch.as_tensor(np.stack(poses, axis=0), device=device, dtype=dtype)
 
     def _build_mlp(self, in_dim, hidden_dim, out_dim):
         return nn.Sequential(
