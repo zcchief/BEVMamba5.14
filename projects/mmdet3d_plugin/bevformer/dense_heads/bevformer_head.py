@@ -48,11 +48,17 @@ class BEVFormerHead(DETRHead):
                  code_weights=None,
                  bev_h=30,
                  bev_w=30,
+                 enable_segmentation=False,
+                 seg_num_classes=0,
+                 use_query_mask_decoder=False,
                  **kwargs):
 
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.fp16_enabled = False
+        self.enable_segmentation = enable_segmentation
+        self.seg_num_classes = seg_num_classes
+        self.use_query_mask_decoder = use_query_mask_decoder
 
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -176,6 +182,19 @@ class BEVFormerHead(DETRHead):
             self.query_embedding = nn.Embedding(self.num_query,
                                                 self.embed_dims * 2)
 
+        if self.enable_segmentation:
+            if self.seg_num_classes <= 0:
+                raise ValueError('seg_num_classes must be > 0 when enable_segmentation=True.')
+            self.seg_proj = nn.Linear(self.embed_dims, self.embed_dims)
+            if self.use_query_mask_decoder:
+                self.seg_queries = nn.Embedding(self.seg_num_classes, self.embed_dims)
+                self.seg_attn = nn.MultiheadAttention(
+                    embed_dim=self.embed_dims,
+                    num_heads=self.transformer.decoder.num_heads,
+                    batch_first=True)
+            else:
+                self.seg_classifier = nn.Linear(self.embed_dims, self.seg_num_classes)
+
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
         self.transformer.init_weights()
@@ -184,6 +203,24 @@ class BEVFormerHead(DETRHead):
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
+
+
+    def _forward_segmentation(self, bev_embed):
+        """Build BEV segmentation logits from BEV tokens."""
+        # bev_embed: [bs, hw, c]
+        x = self.seg_proj(bev_embed)
+        bs, hw, _ = x.shape
+        if self.use_query_mask_decoder:
+            # Query-mask decoder style: one learnable query per class.
+            queries = self.seg_queries.weight.unsqueeze(0).expand(bs, -1, -1)
+            q_out, _ = self.seg_attn(queries, x, x)
+            masks = torch.einsum('bqc,bkc->bqk', q_out, x)
+            seg_logits = masks.reshape(bs, self.seg_num_classes, self.bev_h, self.bev_w)
+        else:
+            # Simplest BEV logits baseline.
+            seg_logits = self.seg_classifier(x)
+            seg_logits = seg_logits.permute(0, 2, 1).reshape(bs, self.seg_num_classes, self.bev_h, self.bev_w)
+        return seg_logits
 
     def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
         """Forward function.
@@ -279,6 +316,8 @@ class BEVFormerHead(DETRHead):
             'enc_cls_scores': None,
             'enc_bbox_preds': None,
         }
+        if self.enable_segmentation:
+            outs['seg_logits'] = self._forward_segmentation(bev_embed)
 
         return outs
 
@@ -572,6 +611,24 @@ class BEVFormerHead_GroupDETR(BEVFormerHead):
         kwargs['num_query'] = group_detr * kwargs['num_query']
         super().__init__(*args, **kwargs)
 
+
+    def _forward_segmentation(self, bev_embed):
+        """Build BEV segmentation logits from BEV tokens."""
+        # bev_embed: [bs, hw, c]
+        x = self.seg_proj(bev_embed)
+        bs, hw, _ = x.shape
+        if self.use_query_mask_decoder:
+            # Query-mask decoder style: one learnable query per class.
+            queries = self.seg_queries.weight.unsqueeze(0).expand(bs, -1, -1)
+            q_out, _ = self.seg_attn(queries, x, x)
+            masks = torch.einsum('bqc,bkc->bqk', q_out, x)
+            seg_logits = masks.reshape(bs, self.seg_num_classes, self.bev_h, self.bev_w)
+        else:
+            # Simplest BEV logits baseline.
+            seg_logits = self.seg_classifier(x)
+            seg_logits = seg_logits.permute(0, 2, 1).reshape(bs, self.seg_num_classes, self.bev_h, self.bev_w)
+        return seg_logits
+
     def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
@@ -649,6 +706,8 @@ class BEVFormerHead_GroupDETR(BEVFormerHead):
             'enc_cls_scores': None,
             'enc_bbox_preds': None,
         }
+        if self.enable_segmentation:
+            outs['seg_logits'] = self._forward_segmentation(bev_embed)
 
         return outs
 
